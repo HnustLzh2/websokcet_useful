@@ -2,20 +2,19 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/gorilla/websocket"
 	"log"
-	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // Client 客户端连接结构
 type Client struct {
 	hub       *Hub
 	conn      *websocket.Conn
-	send      chan []byte  // 发送消息缓冲通道
-	userID    string       // 用户标识
-	sessionID string       // 会话标识
-	mu        sync.RWMutex // 客户端级别锁
+	send      chan []byte // 发送消息缓冲通道
+	userID    string      // 用户标识
+	sessionID string      // 会话标识
 }
 
 // 客户端读取泵（处理接收消息）

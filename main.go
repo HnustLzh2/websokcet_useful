@@ -2,10 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // 安全升级器配置（生产环境优化）
@@ -97,7 +98,21 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	go client.writePump()
 	go client.readPump()
 
-	log.Printf("客户端连接成功: %s", userID)
+	// 发送连接确认消息（包含sessionID，用于前端重连标识）
+	connectMsg := map[string]interface{}{
+		"type":       "connected",
+		"session_id": client.sessionID,
+		"user_id":    userID,
+		"timestamp":  time.Now().Unix(),
+	}
+	msgBytes, _ := json.Marshal(connectMsg)
+	select {
+	case client.send <- msgBytes:
+	case <-time.After(2 * time.Second):
+		log.Printf("发送连接确认消息超时: %s", userID)
+	}
+
+	log.Printf("客户端连接成功: %s (session: %s)", userID, client.sessionID)
 }
 
 // 生成会话ID
