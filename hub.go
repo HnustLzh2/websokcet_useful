@@ -8,16 +8,17 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 )
 
 // Hub 中心管理器（支持多分片）
 type Hub struct {
-	shards      []*Shard              // 分片数组
-	broadcast   chan BroadcastMessage // 全局广播通道
-	redis       *redis.Client         // Redis客户端用于集群通信
-	ctx         context.Context       // 上下文
-	userClients map[string]*Client    // 用户ID到客户端的映射（用于断线重连）
-	mu          sync.RWMutex          // 保护userClients的锁
+	shards      []*Shard                    // 分片数组
+	broadcast   chan BroadcastMessage       // 全局广播通道
+	redis       *redis.Client               // Redis客户端用于集群通信
+	ctx         context.Context             // 上下文
+	userClients map[string]map[*Client]bool // 用户ID到客户端集合的映射（支持多连接）
+	mu          sync.RWMutex                // 保护userClients的锁
 }
 
 // NewHub 新建中心管理器
@@ -26,7 +27,7 @@ func NewHub(shardCount int, redisAddr string) *Hub {
 		shards:      make([]*Shard, shardCount),
 		broadcast:   make(chan BroadcastMessage, 10000), // 全局广播缓冲区
 		ctx:         context.Background(),
-		userClients: make(map[string]*Client), // 初始化用户连接映射
+		userClients: make(map[string]map[*Client]bool), // 初始化用户连接映射（支持多连接）
 	}
 
 	// 初始化Redis客户端
@@ -34,6 +35,9 @@ func NewHub(shardCount int, redisAddr string) *Hub {
 		Addr:     redisAddr,
 		Password: "", // 生产环境设置密码
 		DB:       0,
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled, // 禁用维护通知，避免旧版Redis不支持maint_notifications的警告
+		},
 	})
 
 	// 初始化分片
@@ -113,21 +117,31 @@ func (h *Hub) subscribeRedis() {
 	}
 }
 
-// 定向发送给特定用户（支持断线重连消息队列）
+// 定向发送给特定用户（支持多连接和断线重连消息队列）
 func (h *Hub) sendToUsers(userIDs []string, message []byte) {
 	for _, userID := range userIDs {
 		h.mu.RLock()
-		client, isOnline := h.userClients[userID]
+		clients, isOnline := h.userClients[userID]
 		h.mu.RUnlock()
 
-		if isOnline && client != nil {
-			// 用户在线，直接发送
-			select {
-			case client.send <- message:
-				// 消息成功发送
-			default:
-				// 客户端发送队列满，将消息存入队列
-				log.Printf("用户 %s 发送队列满，消息存入队列", userID)
+		if isOnline && len(clients) > 0 {
+			// 用户在线，向所有连接发送消息
+			sentCount := 0
+			h.mu.RLock()
+			for client := range clients {
+				select {
+				case client.send <- message:
+					sentCount++
+				default:
+					// 客户端发送队列满，记录日志但不阻塞其他连接
+					log.Printf("用户 %s 的连接发送队列满", userID)
+				}
+			}
+			h.mu.RUnlock()
+
+			// 如果所有连接都发送失败，存入队列
+			if sentCount == 0 {
+				log.Printf("用户 %s 的所有连接发送队列满，消息存入队列", userID)
 				h.queueMessage(userID, message)
 			}
 		} else {
@@ -168,61 +182,65 @@ func (h *Hub) getQueuedMessages(userID string) [][]byte {
 }
 
 // 注册客户端到合适的分片 通过userID和shard长度的求余 但是前提是运行的时候 shard长度不能发送变化 userID不能发生变化
+// 支持同一用户的多个连接（多标签页/多设备）
 func (h *Hub) registerClient(client *Client) {
-	// 检查是否已有该用户的连接
+	// 检查用户是否之前没有连接（从离线变为在线）
 	h.mu.Lock()
-	oldClient, exists := h.userClients[client.userID]
-	if exists && oldClient != nil {
-		// 关闭旧连接
-		log.Printf("检测到用户 %s 的旧连接，正在关闭", client.userID)
-		go func() {
-			// 在goroutine中关闭，避免阻塞
-			oldClient.conn.Close()
-			close(oldClient.send)
-		}()
-		// 从分片中注销旧客户端
-		shardIndex := int(oldClient.userID[0]) % len(h.shards)
-		select {
-		case h.shards[shardIndex].unregister <- oldClient:
-		default:
-			// 如果通道已满，直接删除
-			h.shards[shardIndex].mu.Lock()
-			delete(h.shards[shardIndex].clients, oldClient)
-			h.shards[shardIndex].mu.Unlock()
-		}
+	wasOffline := len(h.userClients[client.userID]) == 0
+
+	// 将新连接添加到用户连接集合
+	if h.userClients[client.userID] == nil {
+		h.userClients[client.userID] = make(map[*Client]bool)
 	}
-	// 注册新客户端
-	h.userClients[client.userID] = client
+	h.userClients[client.userID][client] = true
+	connectionCount := len(h.userClients[client.userID])
 	h.mu.Unlock()
+
+	log.Printf("用户 %s 新连接注册，当前连接数: %d", client.userID, connectionCount)
 
 	// 简单哈希分片策略
 	shardIndex := int(client.userID[0]) % len(h.shards)
 	h.shards[shardIndex].register <- client
 
-	// 获取并发送待处理的消息
-	go func() {
-		queuedMessages := h.getQueuedMessages(client.userID)
-		if len(queuedMessages) > 0 {
-			log.Printf("用户 %s 重连，发送 %d 条待处理消息", client.userID, len(queuedMessages))
-			// 按顺序发送队列中的消息
-			for _, msg := range queuedMessages {
-				select {
-				case client.send <- msg:
-				case <-time.After(5 * time.Second):
-					log.Printf("发送待处理消息超时，用户: %s", client.userID)
-					return
+	// 如果用户从离线变为在线，获取并发送待处理的消息
+	// 注意：getQueuedMessages 会删除队列，所以只在从离线变为在线时获取一次
+	if wasOffline {
+		go func() {
+			queuedMessages := h.getQueuedMessages(client.userID)
+			if len(queuedMessages) > 0 {
+				log.Printf("用户 %s 从离线恢复，发送 %d 条待处理消息", client.userID, len(queuedMessages))
+				// 向该用户的所有连接发送待处理消息
+				h.mu.RLock()
+				clients := h.userClients[client.userID]
+				h.mu.RUnlock()
+
+				for _, msg := range queuedMessages {
+					for c := range clients {
+						select {
+						case c.send <- msg:
+						case <-time.After(2 * time.Second):
+							log.Printf("发送待处理消息超时，用户: %s", client.userID)
+						}
+					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 }
 
 // 注销客户端
 func (h *Hub) unregisterClient(client *Client) {
-	// 从用户映射中删除
+	// 从用户连接集合中删除
 	h.mu.Lock()
-	if h.userClients[client.userID] == client {
-		delete(h.userClients, client.userID)
+	if clients, exists := h.userClients[client.userID]; exists {
+		delete(clients, client)
+		// 如果该用户没有连接了，删除整个映射
+		if len(clients) == 0 {
+			delete(h.userClients, client.userID)
+			log.Printf("用户 %s 所有连接已断开", client.userID)
+		} else {
+			log.Printf("用户 %s 断开一个连接，剩余连接数: %d", client.userID, len(clients))
+		}
 	}
 	h.mu.Unlock()
 

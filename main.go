@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -17,10 +18,11 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		// 生产环境应严格校验Origin
 		allowedOrigins := []string{
-			"https://yourdomain.com",
+			"http://127.0.0.1",
 			"https://api.yourdomain.com",
 		}
 		origin := r.Header.Get("Origin")
+		fmt.Println("allowed: ", origin)
 		for _, allowed := range allowedOrigins {
 			if origin == allowed {
 				return true
